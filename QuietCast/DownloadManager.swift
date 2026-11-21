@@ -7,29 +7,49 @@ import os
 final class DownloadManager {
     static let shared = DownloadManager()
 
-    var activeDownloads: [String: Double] = [:] // guid -> progress 0..1
+    var activeDownloads: [String: Double] = [:]  // guid -> progress 0..1
     var downloadedGUIDs: Set<String> = []
 
-    /// Maps URLSessionTask identifiers to episode GUIDs
-    var taskToGUID: [Int: String] = [:]
-    /// Maps episode GUIDs to destination file URLs
-    var guidToDestURL: [String: URL] = [:]
-    /// Maps episode GUIDs to their download tasks (for cancellation)
+    /// In-flight tasks, so a download can be cancelled. The GUID also lives on `taskDescription`.
     private var guidToTask: [String: URLSessionDownloadTask] = [:]
+
+    /// Called once the system has delivered background-session events after relaunch.
+    var backgroundEventsCompletionHandler: (() -> Void)?
 
     static let logger = Logger(subsystem: "com.quietcast", category: "DownloadManager")
     private var sessionDelegate: DownloadSessionDelegate!
     private var backgroundSession: URLSession!
 
+    /// Set before `shared` is created when iOS relaunches the app for a background transfer.
+    private static var pendingBackgroundCompletion: (() -> Void)?
+    private static weak var existing: DownloadManager?
+
+    /// Store the system's completion handler, then make sure the background session exists.
+    static func connectBackgroundSession(_ completion: @escaping () -> Void) {
+        if let existing {
+            existing.backgroundEventsCompletionHandler = completion
+        } else {
+            pendingBackgroundCompletion = completion
+            _ = shared
+        }
+    }
+
     private init() {
         let library = PersistenceManager.shared.loadLibrary()
         downloadedGUIDs = library.downloadedEpisodeGUIDs
+        PersistenceManager.shared.excludeExistingDownloadsFromBackup()
+        Self.sweepIncomingDirectory()
+
+        backgroundEventsCompletionHandler = Self.pendingBackgroundCompletion
+        Self.pendingBackgroundCompletion = nil
+        Self.existing = self
 
         sessionDelegate = DownloadSessionDelegate(manager: self)
         let config = URLSessionConfiguration.background(withIdentifier: "com.quietcast.downloads")
         config.isDiscretionary = false
-        config.sessionSendsLaunchEvents = false
+        config.sessionSendsLaunchEvents = true
         backgroundSession = URLSession(configuration: config, delegate: sessionDelegate, delegateQueue: nil)
+        restoreTasksFromSession()
     }
 
     func isDownloaded(_ episode: Episode) -> Bool {
@@ -49,25 +69,19 @@ final class DownloadManager {
         guard let url = URL(string: episode.audioURL) else { return }
 
         activeDownloads[episode.guid] = 0
-        let destURL = PersistenceManager.shared.localFileURL(for: episode)
-        guidToDestURL[episode.guid] = destURL
 
         let task = backgroundSession.downloadTask(with: url)
-        taskToGUID[task.taskIdentifier] = episode.guid
+        // Persisted by the background session and still available after relaunch,
+        // when the in-memory task map is empty.
+        task.taskDescription = episode.guid
         guidToTask[episode.guid] = task
         task.resume()
     }
 
     func cancelDownload(for episode: Episode) {
         let guid = episode.guid
-        // Cancel the active task
-        if let task = guidToTask[guid] {
-            task.cancel()
-        }
-        // Clean up tracking state
-        activeDownloads.removeValue(forKey: guid)
-        guidToDestURL.removeValue(forKey: guid)
-        guidToTask.removeValue(forKey: guid)
+        guidToTask[guid]?.cancel()
+        forgetDownload(guid)
         // Remove any partially written file
         let fileURL = PersistenceManager.shared.localFileURL(for: episode)
         try? FileManager.default.removeItem(at: fileURL)
@@ -86,22 +100,26 @@ final class DownloadManager {
         let guids = Set(cachedEpisodes.map { $0.guid })
 
         for guid in guids {
-            if let task = guidToTask[guid] {
-                task.cancel()
-            }
-            activeDownloads.removeValue(forKey: guid)
-            guidToDestURL.removeValue(forKey: guid)
-            guidToTask.removeValue(forKey: guid)
+            guidToTask[guid]?.cancel()
+            forgetDownload(guid)
         }
 
         // Also remove GUIDs from the in-memory downloaded set (files are deleted by PersistenceManager)
         downloadedGUIDs.subtract(guids)
     }
 
-    func cleanupTask(for guid: String, taskId: Int) {
-        taskToGUID.removeValue(forKey: taskId)
-        guidToDestURL.removeValue(forKey: guid)
+    /// Drop in-memory progress and the cancel handle for one episode.
+    func forgetDownload(_ guid: String) {
+        activeDownloads.removeValue(forKey: guid)
         guidToTask.removeValue(forKey: guid)
+    }
+
+    /// GUID from the task description, or from the in-memory task map if the description is missing.
+    func guid(for task: URLSessionTask) -> String? {
+        if let described = Self.normalizedGUID(task.taskDescription) {
+            return described
+        }
+        return guidToTask.first { $0.value === task }?.key
     }
 
     /// Cancel all active download tasks and clear tracking state.
@@ -111,14 +129,58 @@ final class DownloadManager {
         }
         activeDownloads.removeAll()
         guidToTask.removeAll()
-        guidToDestURL.removeAll()
-        taskToGUID.removeAll()
     }
 
     func saveDownloadState() {
-        var library = PersistenceManager.shared.loadLibrary()
-        library.downloadedEpisodeGUIDs = downloadedGUIDs
-        PersistenceManager.shared.saveLibrary(library)
+        PersistenceManager.shared.update { library in
+            library.downloadedEpisodeGUIDs = downloadedGUIDs
+        }
+    }
+
+    /// Rebuild the cancel map from tasks the system kept across relaunch.
+    private func restoreTasksFromSession() {
+        backgroundSession.getAllTasks { [weak self] tasks in
+            Task { @MainActor in
+                guard let self else { return }
+                for task in tasks {
+                    guard let guid = Self.normalizedGUID(task.taskDescription),
+                        let downloadTask = task as? URLSessionDownloadTask
+                    else { continue }
+                    self.guidToTask[guid] = downloadTask
+                    if self.activeDownloads[guid] == nil {
+                        self.activeDownloads[guid] = 0
+                    }
+                }
+            }
+        }
+    }
+
+    nonisolated fileprivate static func normalizedGUID(_ raw: String?) -> String? {
+        let guid = raw?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return guid.isEmpty ? nil : guid
+    }
+
+    /// Files moved out of the system download location before we know their destination.
+    nonisolated fileprivate static func incomingDirectory() -> URL {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("quietcast-incoming", isDirectory: true)
+        try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        return directory
+    }
+
+    /// Drop leftovers from a previous launch. A finished download is moved to its
+    /// final path before the delegate returns, so anything still here is unusable.
+    private static func sweepIncomingDirectory() {
+        let directory = incomingDirectory()
+        guard
+            let files = try? FileManager.default.contentsOfDirectory(
+                at: directory,
+                includingPropertiesForKeys: nil
+            )
+        else { return }
+        for file in files {
+            try? FileManager.default.removeItem(at: file)
+        }
     }
 }
 
@@ -137,15 +199,41 @@ private class DownloadSessionDelegate: NSObject, URLSessionDownloadDelegate {
         downloadTask: URLSessionDownloadTask,
         didFinishDownloadingTo location: URL
     ) {
-        let taskId = downloadTask.taskIdentifier
-
-        // Must move file synchronously — system deletes it when this method returns
+        let describedGUID = DownloadManager.normalizedGUID(downloadTask.taskDescription)
+        let statusCode = (downloadTask.response as? HTTPURLResponse)?.statusCode
+        guard let statusCode, (200...299).contains(statusCode) else {
+            logger.error("Not saving download, HTTP status \(statusCode.map(String.init) ?? "missing")")
+            Task { @MainActor in
+                let guid = describedGUID ?? self.manager?.guid(for: downloadTask)
+                guard let guid else { return }
+                self.finishTracking(guid: guid, saved: false)
+            }
+            return
+        }
         let fm = FileManager.default
 
-        // We need to read from the manager, but it's MainActor-isolated.
-        // Copy the file to a safe temp location first, then update state on MainActor.
-        let tempDir = fm.temporaryDirectory
-        let tempCopy = tempDir.appendingPathComponent(UUID().uuidString + ".tmp")
+        // The system deletes `location` when this method returns. If we know the
+        // episode, move it to the final path now so a relaunch with empty maps
+        // still keeps the file. Otherwise park it in our incoming directory.
+        if let guid = describedGUID {
+            let destURL = PersistenceManager.shared.localFileURL(forEpisodeGUID: guid)
+            do {
+                try? fm.removeItem(at: destURL)
+                try fm.moveItem(at: location, to: destURL)
+            } catch {
+                logger.error("Failed to save downloaded file for \(guid): \(error.localizedDescription)")
+                Task { @MainActor in
+                    self.finishTracking(guid: guid, saved: false)
+                }
+                return
+            }
+            Task { @MainActor in
+                self.finishTracking(guid: guid, saved: true)
+            }
+            return
+        }
+
+        let tempCopy = DownloadManager.incomingDirectory().appendingPathComponent(UUID().uuidString + ".tmp")
         do {
             try fm.moveItem(at: location, to: tempCopy)
         } catch {
@@ -154,23 +242,26 @@ private class DownloadSessionDelegate: NSObject, URLSessionDownloadDelegate {
         }
 
         Task { @MainActor in
-            guard let manager = self.manager else { return }
-            guard let guid = manager.taskToGUID[taskId] else { return }
-            guard let destURL = manager.guidToDestURL[guid] else { return }
-
-            let fm = FileManager.default
-            try? fm.removeItem(at: destURL)
+            let removeTemp = {
+                try? FileManager.default.removeItem(at: tempCopy)
+            }
+            guard let manager = self.manager,
+                let guid = manager.guid(for: downloadTask)
+            else {
+                removeTemp()
+                self.logger.error("Download finished with no episode id; deleted temp file")
+                return
+            }
+            let destURL = PersistenceManager.shared.localFileURL(forEpisodeGUID: guid)
             do {
-                try fm.moveItem(at: tempCopy, to: destURL)
-                manager.activeDownloads.removeValue(forKey: guid)
-                manager.downloadedGUIDs.insert(guid)
-                manager.saveDownloadState()
+                try? FileManager.default.removeItem(at: destURL)
+                try FileManager.default.moveItem(at: tempCopy, to: destURL)
+                self.finishTracking(guid: guid, saved: true)
             } catch {
-                manager.activeDownloads.removeValue(forKey: guid)
-                try? fm.removeItem(at: tempCopy)
+                removeTemp()
+                self.finishTracking(guid: guid, saved: false)
                 self.logger.error("Failed to move download for \(guid): \(error.localizedDescription)")
             }
-            manager.cleanupTask(for: guid, taskId: taskId)
         }
     }
 
@@ -181,14 +272,14 @@ private class DownloadSessionDelegate: NSObject, URLSessionDownloadDelegate {
         totalBytesWritten: Int64,
         totalBytesExpectedToWrite: Int64
     ) {
-        let taskId = downloadTask.taskIdentifier
+        guard totalBytesExpectedToWrite > 0 else { return }
+        let describedGUID = DownloadManager.normalizedGUID(downloadTask.taskDescription)
+        let pct = min(Double(totalBytesWritten) / Double(totalBytesExpectedToWrite), 1.0)
         Task { @MainActor in
-            guard let manager = self.manager,
-                  let guid = manager.taskToGUID[taskId] else { return }
-            if totalBytesExpectedToWrite > 0 {
-                let pct = Double(totalBytesWritten) / Double(totalBytesExpectedToWrite)
-                manager.activeDownloads[guid] = min(pct, 1.0)
-            }
+            guard let manager = self.manager else { return }
+            let guid = describedGUID ?? manager.guid(for: downloadTask)
+            guard let guid else { return }
+            manager.activeDownloads[guid] = pct
         }
     }
 
@@ -198,13 +289,36 @@ private class DownloadSessionDelegate: NSObject, URLSessionDownloadDelegate {
         didCompleteWithError error: Error?
     ) {
         guard error != nil else { return }
-        let taskId = task.taskIdentifier
+        let describedGUID = DownloadManager.normalizedGUID(task.taskDescription)
         Task { @MainActor in
             guard let manager = self.manager else { return }
-            if let guid = manager.taskToGUID[taskId] {
-                manager.activeDownloads.removeValue(forKey: guid)
-                manager.cleanupTask(for: guid, taskId: taskId)
-            }
+            let guid = describedGUID ?? manager.guid(for: task)
+            guard let guid else { return }
+            manager.forgetDownload(guid)
         }
+    }
+
+    func urlSessionDidFinishEvents(forBackgroundURLSession session: URLSession) {
+        Task { @MainActor in
+            // Task scheduled from didFinishDownloadingTo runs first and flushes.
+            PersistenceManager.shared.flushToDisk()
+            guard let manager = self.manager else { return }
+            let handler = manager.backgroundEventsCompletionHandler
+            manager.backgroundEventsCompletionHandler = nil
+            handler?()
+        }
+    }
+
+    @MainActor
+    private func finishTracking(guid: String, saved: Bool) {
+        guard let manager else { return }
+        if saved {
+            let destURL = PersistenceManager.shared.localFileURL(forEpisodeGUID: guid)
+            PersistenceManager.shared.excludeFromBackup(url: destURL)
+            manager.downloadedGUIDs.insert(guid)
+            manager.saveDownloadState()
+            PersistenceManager.shared.flushToDisk()
+        }
+        manager.forgetDownload(guid)
     }
 }

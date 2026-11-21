@@ -23,14 +23,23 @@ struct NowPlayingBar: View {
                 .padding(.horizontal)
                 .padding(.top, 6)
 
+            if let playbackError = audioPlayer.playbackError {
+                Text(playbackError)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal)
+            }
+
             // Scrubber
             scrubber
 
             // Time labels
             HStack {
-                Text(formatDuration(displayTime))
+                Text(PlaybackText.clock(displayTime))
                 Spacer()
-                Text("-\(formatDuration(max(audioPlayer.duration - displayTime, 0)))")
+                Text("-\(PlaybackText.clock(max(audioPlayer.duration - displayTime, 0)))")
             }
             .font(.caption2)
             .foregroundStyle(.secondary)
@@ -77,14 +86,14 @@ struct NowPlayingBar: View {
     private var transportControls: some View {
         HStack(spacing: 20) {
             // Noise cancellation toggle
-            if audioPlayer.systemVolumeCapEnabled {
+            if AppSettings.shared.systemVolumeCapEnabled {
                 Button {
-                    audioPlayer.setNoiseCancellation(!audioPlayer.noiseCancellationOn)
+                    AppSettings.shared.noiseCancellationOn = !AppSettings.shared.noiseCancellationOn
                 } label: {
-                    Image(systemName: audioPlayer.noiseCancellationOn ? "ear.fill" : "ear")
+                    Image(systemName: AppSettings.shared.noiseCancellationOn ? "ear.fill" : "ear")
                         .font(.title3)
                         .frame(minWidth: 44, minHeight: 44)
-                        .foregroundStyle(audioPlayer.noiseCancellationOn ? Color.warmAccent : .secondary)
+                        .foregroundStyle(AppSettings.shared.noiseCancellationOn ? Color.warmAccent : .secondary)
                 }
             }
 
@@ -94,7 +103,7 @@ struct NowPlayingBar: View {
                 Button {
                     speakSleepTimerRemaining()
                 } label: {
-                    Text(formatTimeRemaining(remaining))
+                    Text(PlaybackText.countdown(remaining))
                         .font(.caption2)
                         .monospacedDigit()
                         .padding(.horizontal, 6)
@@ -116,11 +125,11 @@ struct NowPlayingBar: View {
                 }
             }
 
-            // Skip back 30s
+            // Skip back
             Button {
                 audioPlayer.skipBackward()
             } label: {
-                Image(systemName: "gobackward.30")
+                Image(systemName: "gobackward.\(AppSettings.skipIntervalSeconds)")
                     .font(.title2)
                     .frame(minWidth: 44, minHeight: 44)
             }
@@ -144,11 +153,11 @@ struct NowPlayingBar: View {
                     .frame(minWidth: 44, minHeight: 44)
             }
 
-            // Skip forward 30s
+            // Skip forward
             Button {
                 audioPlayer.skipForward()
             } label: {
-                Image(systemName: "goforward.30")
+                Image(systemName: "goforward.\(AppSettings.skipIntervalSeconds)")
                     .font(.title2)
                     .frame(minWidth: 44, minHeight: 44)
             }
@@ -157,18 +166,18 @@ struct NowPlayingBar: View {
             Menu {
                 ForEach(rates, id: \.self) { rate in
                     Button {
-                        audioPlayer.setRate(rate)
+                        AppSettings.shared.playbackRate = rate
                     } label: {
                         HStack {
-                            Text(formatRate(rate))
-                            if audioPlayer.playbackRate == rate {
+                            Text(PlaybackText.rate(rate))
+                            if AppSettings.shared.playbackRate == rate {
                                 Image(systemName: "checkmark")
                             }
                         }
                     }
                 }
             } label: {
-                Text(formatRate(audioPlayer.playbackRate))
+                Text(PlaybackText.rate(AppSettings.shared.playbackRate))
                     .font(.caption)
                     .padding(.horizontal, 6)
                     .padding(.vertical, 2)
@@ -209,61 +218,10 @@ struct NowPlayingBar: View {
         }
 
         // Remember whether the podcast was playing, so we only resume if it was
-        let wasPlaying = audioPlayer.isPlaying
-        if wasPlaying {
-            audioPlayer.pausePlayback()
-        }
-
-        SpeechAnnouncer.shared.speak("Sleep timer: \(formatRemainingForSpeech(remaining)).") {
+        audioPlayer.pauseThenSpeak("Sleep timer: \(PlaybackText.spokenRemaining(remaining)).") { wasPlaying in
             if wasPlaying {
                 audioPlayer.resumePlaybackWithoutResettingTimer()
             }
         }
-    }
-
-    /// Exact hours/minutes/seconds — no rounding.
-    private func formatRemainingForSpeech(_ seconds: Double) -> String {
-        let total = max(Int(seconds.rounded()), 0)
-        let h = total / 3600
-        let m = (total % 3600) / 60
-        let s = total % 60
-
-        var parts: [String] = []
-        if h > 0 {
-            parts.append("\(h) hour\(h == 1 ? "" : "s")")
-        }
-        if m > 0 {
-            parts.append("\(m) minute\(m == 1 ? "" : "s")")
-        }
-        if s > 0 || parts.isEmpty {
-            parts.append("\(s) second\(s == 1 ? "" : "s")")
-        }
-        return parts.joined(separator: ", ")
-    }
-
-    // MARK: - Formatting
-
-    private func formatRate(_ rate: Float) -> String {
-        if rate == Float(Int(rate)) {
-            return "\(Int(rate))x"
-        }
-        return String(format: "%.2gx", rate)
-    }
-
-    private func formatDuration(_ seconds: Double) -> String {
-        let total = max(Int(seconds), 0)
-        let h = total / 3600
-        let m = (total % 3600) / 60
-        let s = total % 60
-        if h > 0 {
-            return String(format: "%d:%02d:%02d", h, m, s)
-        }
-        return String(format: "%d:%02d", m, s)
-    }
-
-    private func formatTimeRemaining(_ seconds: Double) -> String {
-        let mins = Int(seconds) / 60
-        let secs = Int(seconds) % 60
-        return String(format: "%d:%02d", mins, secs)
     }
 }

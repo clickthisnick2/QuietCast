@@ -23,23 +23,24 @@ enum HTMLCleaner {
             options: .regularExpression
         )
 
-        // Decode common HTML entities
-        let entities: [String: String] = [
-            "&amp;": "&",
-            "&lt;": "<",
-            "&gt;": ">",
-            "&quot;": "\"",
-            "&apos;": "'",
-            "&#39;": "'",
-            "&nbsp;": " ",
-            "&#8217;": "\u{2019}",
-            "&#8216;": "\u{2018}",
-            "&#8220;": "\u{201C}",
-            "&#8221;": "\u{201D}",
-            "&#8211;": "\u{2013}",
-            "&#8212;": "\u{2014}",
-            "&#8230;": "\u{2026}",
-            "&#160;": " ",
+        // Named entities, in a fixed order. `&amp;` is last so `&amp;lt;` becomes
+        // `&lt;` and is not decoded a second time.
+        let entities: [(String, String)] = [
+            ("&lt;", "<"),
+            ("&gt;", ">"),
+            ("&quot;", "\""),
+            ("&apos;", "'"),
+            ("&#39;", "'"),
+            ("&nbsp;", " "),
+            ("&#160;", " "),
+            ("&#8217;", "\u{2019}"),
+            ("&#8216;", "\u{2018}"),
+            ("&#8220;", "\u{201C}"),
+            ("&#8221;", "\u{201D}"),
+            ("&#8211;", "\u{2013}"),
+            ("&#8212;", "\u{2014}"),
+            ("&#8230;", "\u{2026}"),
+            ("&amp;", "&"),
         ]
         for (entity, replacement) in entities {
             text = text.replacingOccurrences(of: entity, with: replacement)

@@ -1,5 +1,17 @@
 import Foundation
+#if canImport(os)
 import os
+#endif
+
+#if !canImport(os)
+/// Stand-in for `os.Logger` when the logic library is built on Linux.
+struct Logger {
+    init(subsystem: String, category: String) {}
+    func info(_ message: String) {}
+    func error(_ message: String) {}
+    func warning(_ message: String) {}
+}
+#endif
 
 struct LibraryData: Codable {
     var podcasts: [Podcast]
@@ -9,16 +21,18 @@ struct LibraryData: Codable {
     var lastPlayedEpisodeGUID: String?
     var lastPlayedFeedURL: String?
     var crownPodcastRotation: [String]
-    var podcastSkipSeconds: [String: Int] // feedURL -> custom skip duration in seconds
+    var podcastSkipSeconds: [String: Int]  // feedURL -> custom skip duration in seconds
 
-    init(podcasts: [Podcast] = [],
-         downloadedEpisodeGUIDs: Set<String> = [],
-         playbackPositions: [String: Double] = [:],
-         playedEpisodeGUIDs: Set<String> = [],
-         lastPlayedEpisodeGUID: String? = nil,
-         lastPlayedFeedURL: String? = nil,
-         crownPodcastRotation: [String] = [],
-         podcastSkipSeconds: [String: Int] = [:]) {
+    init(
+        podcasts: [Podcast] = [],
+        downloadedEpisodeGUIDs: Set<String> = [],
+        playbackPositions: [String: Double] = [:],
+        playedEpisodeGUIDs: Set<String> = [],
+        lastPlayedEpisodeGUID: String? = nil,
+        lastPlayedFeedURL: String? = nil,
+        crownPodcastRotation: [String] = [],
+        podcastSkipSeconds: [String: Int] = [:]
+    ) {
         self.podcasts = podcasts
         self.downloadedEpisodeGUIDs = downloadedEpisodeGUIDs
         self.playbackPositions = playbackPositions
@@ -31,8 +45,10 @@ struct LibraryData: Codable {
 
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
-        podcasts = try container.decode([Podcast].self, forKey: .podcasts)
-        downloadedEpisodeGUIDs = try container.decode(Set<String>.self, forKey: .downloadedEpisodeGUIDs)
+        // Missing keys are treated as empty so an older library.json still loads.
+        // A present key with the wrong type still throws and is backed up.
+        podcasts = try container.decodeIfPresent([Podcast].self, forKey: .podcasts) ?? []
+        downloadedEpisodeGUIDs = try container.decodeIfPresent(Set<String>.self, forKey: .downloadedEpisodeGUIDs) ?? []
         playbackPositions = try container.decodeIfPresent([String: Double].self, forKey: .playbackPositions) ?? [:]
         playedEpisodeGUIDs = try container.decodeIfPresent(Set<String>.self, forKey: .playedEpisodeGUIDs) ?? []
         lastPlayedEpisodeGUID = try container.decodeIfPresent(String.self, forKey: .lastPlayedEpisodeGUID)
@@ -49,9 +65,20 @@ final class PersistenceManager {
     private let fileManager = FileManager.default
     private let logger = Logger(subsystem: "com.quietcast", category: "PersistenceManager")
 
+    /// Tests point this at a temporary folder. Nil uses the app group container or Documents.
+    var storageDirectoryOverride: URL?
+
+    /// Tests set this to false to keep an unreadable library.json in place.
+    var allowsCorruptBackup = true
+
+    init() {}
+
     /// In-memory cache — avoids repeated disk reads
     private var cachedLibrary: LibraryData?
     private var saveTask: Task<Void, Never>?
+    /// True when library.json could not be decoded and could not be moved aside.
+    /// Writes stay off so a later save cannot replace the unread file with an empty one.
+    private var blockOverwrite = false
 
     private var libraryFileURL: URL {
         documentsDirectory().appendingPathComponent("library.json")
@@ -75,22 +102,67 @@ final class PersistenceManager {
             return library
         } catch {
             logger.error("Failed to decode library.json: \(error.localizedDescription)")
+            if backupCorruptLibrary(at: url) {
+                blockOverwrite = false
+            } else {
+                blockOverwrite = true
+                logger.error("library.json was left in place. Saves are blocked so it is not overwritten.")
+            }
             let empty = LibraryData(podcasts: [], downloadedEpisodeGUIDs: [])
             cachedLibrary = empty
             return empty
         }
     }
 
-    func saveLibrary(_ library: LibraryData) {
+    /// Move an unreadable library.json to `library.json.corrupt-<date>` so a later save cannot destroy it.
+    private func backupCorruptLibrary(at url: URL) -> Bool {
+        guard allowsCorruptBackup else { return false }
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone(secondsFromGMT: 0)
+        formatter.dateFormat = "yyyyMMdd-HHmmss"
+        let stamp = formatter.string(from: Date())
+        let directory = url.deletingLastPathComponent()
+        var destination = directory.appendingPathComponent("library.json.corrupt-\(stamp)")
+        var attempt = 1
+        while fileManager.fileExists(atPath: destination.path) {
+            destination = directory.appendingPathComponent("library.json.corrupt-\(stamp)-\(attempt)")
+            attempt += 1
+        }
+        do {
+            try fileManager.moveItem(at: url, to: destination)
+            logger.error("Moved unreadable library.json to \(destination.lastPathComponent)")
+            return true
+        } catch {
+            logger.error("Could not back up library.json: \(error.localizedDescription)")
+            return false
+        }
+    }
+
+    private func saveLibrary(_ library: LibraryData) {
         cachedLibrary = library
         scheduleSave()
+    }
+
+    /// Load the in-memory library, change it, and save.
+    /// Position updates pass `flushImmediately` so one write hits disk now.
+    /// Other edits stay on the short debounced save.
+    func update(flushImmediately: Bool = false, _ mutate: (inout LibraryData) -> Void) {
+        var library = loadLibrary()
+        mutate(&library)
+        if flushImmediately {
+            cachedLibrary = library
+            flushToDisk()
+        } else {
+            saveLibrary(library)
+        }
     }
 
     /// Debounced disk write — coalesces rapid saves (e.g. position updates) into one write
     private func scheduleSave() {
         saveTask?.cancel()
         saveTask = Task {
-            try? await Task.sleep(nanoseconds: 500_000_000) // 0.5 second debounce
+            try? await Task.sleep(nanoseconds: 500_000_000)  // 0.5 second debounce
             guard !Task.isCancelled else { return }
             self.writeToDisk()
         }
@@ -103,6 +175,10 @@ final class PersistenceManager {
     }
 
     private func writeToDisk() {
+        guard !blockOverwrite else {
+            logger.error("Refusing to overwrite library.json after a decode failure that could not be backed up.")
+            return
+        }
         guard let library = cachedLibrary else { return }
         do {
             let data = try JSONEncoder().encode(library)
@@ -113,29 +189,71 @@ final class PersistenceManager {
     }
 
     func documentsDirectory() -> URL {
+        if let storageDirectoryOverride {
+            return storageDirectoryOverride
+        }
+        #if os(iOS) || os(macOS) || os(tvOS) || os(watchOS) || os(visionOS)
         if let groupURL = fileManager.containerURL(forSecurityApplicationGroupIdentifier: Self.appGroupID) {
             return groupURL
         }
-        logger.warning("App Group container not available for '\(Self.appGroupID)' — falling back to Documents directory. Data will not persist across reinstalls.")
+        logger.warning(
+            "App Group container not available for '\(Self.appGroupID)' — falling back to Documents directory. Data will not persist across reinstalls."
+        )
+        #endif
         return fileManager.urls(for: .documentDirectory, in: .userDomainMask)[0]
     }
 
     func localFileURL(for episode: Episode) -> URL {
-        let safeName = episode.guid
-            .replacingOccurrences(of: "/", with: "_")
-            .replacingOccurrences(of: ":", with: "_")
-        return documentsDirectory().appendingPathComponent("download_\(safeName).mp3")
+        localFileURL(forEpisodeGUID: episode.guid)
+    }
+
+    /// Destination path for a download. Uses only the GUID so a finished
+    /// background task can be saved after relaunch, when the Episode is gone.
+    func localFileURL(forEpisodeGUID guid: String) -> URL {
+        storageFile(prefix: "download_", raw: guid, ext: "mp3")
     }
 
     func isDownloaded(_ episode: Episode) -> Bool {
         fileManager.fileExists(atPath: localFileURL(for: episode).path)
     }
 
+    /// Keep downloaded audio out of iCloud backup. The files are large and can be fetched again.
+    func excludeFromBackup(url: URL) {
+        var values = URLResourceValues()
+        values.isExcludedFromBackup = true
+        var mutable = url
+        do {
+            try mutable.setResourceValues(values)
+        } catch {
+            logger.error("Failed to exclude \(url.lastPathComponent) from backup: \(error.localizedDescription)")
+        }
+    }
+
+    func excludeExistingDownloadsFromBackup() {
+        let docs = documentsDirectory()
+        guard let files = try? fileManager.contentsOfDirectory(at: docs, includingPropertiesForKeys: nil) else {
+            return
+        }
+        for file in files where file.lastPathComponent.hasPrefix("download_") {
+            excludeFromBackup(url: file)
+        }
+    }
+
     func savePlaybackPosition(_ seconds: Double, for guid: String) {
-        var library = loadLibrary()
-        library.playbackPositions[guid] = seconds
-        cachedLibrary = library
-        flushToDisk()
+        update(flushImmediately: true) { library in
+            library.playbackPositions[guid] = seconds
+        }
+    }
+
+    /// Position and last-played episode in one disk write. Used by the playback tick.
+    func savePlaybackProgress(seconds: Double, guid: String, feedURL: String?) {
+        update(flushImmediately: true) { library in
+            library.playbackPositions[guid] = seconds
+            if let feedURL {
+                library.lastPlayedEpisodeGUID = guid
+                library.lastPlayedFeedURL = feedURL
+            }
+        }
     }
 
     func playbackPosition(for guid: String) -> Double {
@@ -143,9 +261,9 @@ final class PersistenceManager {
     }
 
     func markPlayed(_ guid: String) {
-        var library = loadLibrary()
-        library.playedEpisodeGUIDs.insert(guid)
-        saveLibrary(library)
+        update { library in
+            library.playedEpisodeGUIDs.insert(guid)
+        }
     }
 
     func isPlayed(_ guid: String) -> Bool {
@@ -154,20 +272,13 @@ final class PersistenceManager {
 
     // MARK: - Last Played Episode
 
-    func saveLastPlayedEpisode(guid: String, feedURL: String) {
-        var library = loadLibrary()
-        library.lastPlayedEpisodeGUID = guid
-        library.lastPlayedFeedURL = feedURL
-        cachedLibrary = library
-        scheduleSave()
-    }
-
     /// Loads the last played episode from the episode cache, if available.
     func loadLastPlayedEpisode() -> Episode? {
         let library = loadLibrary()
         guard let guid = library.lastPlayedEpisodeGUID,
-              let feedURL = library.lastPlayedFeedURL,
-              let episodes = cachedEpisodes(for: feedURL) else {
+            let feedURL = library.lastPlayedFeedURL,
+            let episodes = cachedEpisodes(for: feedURL)
+        else {
             return nil
         }
         return episodes.first { $0.guid == guid }
@@ -180,24 +291,30 @@ final class PersistenceManager {
     }
 
     func setSkipSeconds(_ seconds: Int?, for feedURL: String) {
-        var library = loadLibrary()
-        library.podcastSkipSeconds[feedURL] = seconds
-        saveLibrary(library)
+        update { library in
+            library.podcastSkipSeconds[feedURL] = seconds
+        }
     }
 
     // MARK: - Episode Cache
 
     private func episodeCacheURL(for feedURL: String) -> URL {
-        let safeName = feedURL
+        storageFile(prefix: "cache_", raw: feedURL, ext: "json")
+    }
+
+    private func storageFile(prefix: String, raw: String, ext: String) -> URL {
+        let safe =
+            raw
             .replacingOccurrences(of: "/", with: "_")
             .replacingOccurrences(of: ":", with: "_")
-        return documentsDirectory().appendingPathComponent("cache_\(safeName).json")
+        return documentsDirectory().appendingPathComponent("\(prefix)\(safe).\(ext)")
     }
 
     func cachedEpisodes(for feedURL: String) -> [Episode]? {
         let url = episodeCacheURL(for: feedURL)
         guard let data = try? Data(contentsOf: url),
-              let episodes = try? JSONDecoder().decode([Episode].self, from: data) else {
+            let episodes = try? JSONDecoder().decode([Episode].self, from: data)
+        else {
             return nil
         }
         return episodes
@@ -221,29 +338,36 @@ final class PersistenceManager {
         let cachedEpisodes = cachedEpisodes(for: feedURL) ?? []
         let guids = Set(cachedEpisodes.map { $0.guid })
 
-        var library = loadLibrary()
-
-        // Remove downloaded files and tracked GUIDs
         for episode in cachedEpisodes {
             let fileURL = localFileURL(for: episode)
             try? fileManager.removeItem(at: fileURL)
         }
-        library.downloadedEpisodeGUIDs.subtract(guids)
+        try? fileManager.removeItem(at: episodeCacheURL(for: feedURL))
 
-        // Remove playback positions and played markers for these episodes
-        for guid in guids {
-            library.playbackPositions.removeValue(forKey: guid)
-            library.playedEpisodeGUIDs.remove(guid)
+        update { library in
+            library.downloadedEpisodeGUIDs.subtract(guids)
+            for guid in guids {
+                library.playbackPositions.removeValue(forKey: guid)
+                library.playedEpisodeGUIDs.remove(guid)
+            }
+            if library.lastPlayedFeedURL == feedURL
+                || guids.contains(library.lastPlayedEpisodeGUID ?? "")
+            {
+                library.lastPlayedEpisodeGUID = nil
+                library.lastPlayedFeedURL = nil
+            }
+            library.podcastSkipSeconds.removeValue(forKey: feedURL)
         }
 
-        // Remove the episode cache file
-        let cacheURL = episodeCacheURL(for: feedURL)
-        try? fileManager.removeItem(at: cacheURL)
-
-        saveLibrary(library)
+        let excluded = AppSettings.shared.randomExcludedFeedURLs
+        let kept = excluded.filter { $0 != feedURL }
+        if kept.count != excluded.count {
+            AppSettings.shared.randomExcludedFeedURLs = kept
+        }
     }
 
     func clearAllData() {
+        blockOverwrite = false
         cachedLibrary = nil
         saveTask?.cancel()
 

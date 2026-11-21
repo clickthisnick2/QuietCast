@@ -1,5 +1,4 @@
 import MediaPlayer
-import os
 
 /// Configures MPRemoteCommandCenter handlers and manages crown action state.
 @MainActor
@@ -9,62 +8,51 @@ final class RemoteCommandHandler {
     /// Prevents concurrent crown actions (double-press and triple-press).
     private(set) var isCrownActionActive = false
 
-    private let logger = Logger(subsystem: "com.quietcast", category: "RemoteCommandHandler")
+    /// Release the crown mutex without running the speech completion.
+    /// Used when speech is stopped and that completion is discarded.
+    func cancelCrownAction() {
+        isCrownActionActive = false
+    }
 
     private init() {}
 
     func setupRemoteCommands() {
         let center = MPRemoteCommandCenter.shared()
+        let skipInterval = NSNumber(value: AppSettings.skipIntervalSeconds)
 
-        center.playCommand.addTarget { _ in
-            Task { @MainActor in
-                AudioPlayer.shared.togglePlayPause()
-            }
-            return .success
+        addCommand(center.playCommand) {
+            AudioPlayer.shared.play()
+        }
+        addCommand(center.pauseCommand) {
+            AudioPlayer.shared.pause()
+        }
+        addCommand(center.togglePlayPauseCommand) {
+            AudioPlayer.shared.togglePlayPause()
         }
 
-        center.pauseCommand.addTarget { _ in
-            Task { @MainActor in
-                AudioPlayer.shared.pause()
-            }
-            return .success
+        center.skipForwardCommand.preferredIntervals = [skipInterval]
+        addCommand(center.skipForwardCommand) {
+            AudioPlayer.shared.skipForward()
         }
-
-        center.togglePlayPauseCommand.addTarget { _ in
-            Task { @MainActor in
-                AudioPlayer.shared.togglePlayPause()
-            }
-            return .success
-        }
-
-        center.skipForwardCommand.preferredIntervals = [30]
-        center.skipForwardCommand.addTarget { _ in
-            Task { @MainActor in
-                AudioPlayer.shared.skipForward()
-            }
-            return .success
-        }
-
-        center.skipBackwardCommand.preferredIntervals = [30]
-        center.skipBackwardCommand.addTarget { _ in
-            Task { @MainActor in
-                AudioPlayer.shared.skipBackward()
-            }
-            return .success
+        center.skipBackwardCommand.preferredIntervals = [skipInterval]
+        addCommand(center.skipBackwardCommand) {
+            AudioPlayer.shared.skipBackward()
         }
 
         // Double-press crown/AirPods plays a random old episode
-        center.nextTrackCommand.addTarget { [weak self] _ in
-            Task { @MainActor [weak self] in
-                self?.playRandomOldEpisode()
-            }
-            return .success
+        addCommand(center.nextTrackCommand) { [weak self] in
+            self?.playRandomOldEpisode()
         }
-
         // Triple-press crown/AirPods speaks the current time
-        center.previousTrackCommand.addTarget { [weak self] _ in
-            Task { @MainActor [weak self] in
-                self?.speakCurrentTime()
+        addCommand(center.previousTrackCommand) { [weak self] in
+            self?.speakCurrentTime()
+        }
+    }
+
+    private func addCommand(_ command: MPRemoteCommand, action: @escaping @MainActor () -> Void) {
+        command.addTarget { _ in
+            Task { @MainActor in
+                action()
             }
             return .success
         }
@@ -74,14 +62,11 @@ final class RemoteCommandHandler {
     func speakCurrentTime() {
         guard !isCrownActionActive else { return }
         isCrownActionActive = true
-        let wasPlaying = AudioPlayer.shared.isPlaying
-        if wasPlaying { AudioPlayer.shared.pausePlayback() }
-
         let formatter = DateFormatter()
         formatter.timeStyle = .short
         formatter.dateStyle = .none
         let timeString = formatter.string(from: Date())
-        SpeechAnnouncer.shared.speak("The time is \(timeString)") { [weak self] in
+        AudioPlayer.shared.pauseThenSpeak("The time is \(timeString)") { [weak self] wasPlaying in
             Task { @MainActor [weak self] in
                 self?.isCrownActionActive = false
                 if wasPlaying { AudioPlayer.shared.resumePlayback() }
@@ -93,18 +78,17 @@ final class RemoteCommandHandler {
     func playRandomOldEpisode() {
         guard !isCrownActionActive else { return }
         isCrownActionActive = true
-        let ageDays = AppSettings.randomEpisodeAgeDays
-        let cutoff = Calendar.current.date(byAdding: .day, value: -ageDays, to: Date()) ?? Date()
-        let cutoffTimestamp = cutoff.timeIntervalSince1970
-        let excludedFeedURLs = Set(AppSettings.randomExcludedFeedURLs)
+        let ageDays = AppSettings.shared.randomEpisodeAgeDays
+        let excludedFeedURLs = Set(AppSettings.shared.randomExcludedFeedURLs)
 
         let persistence = PersistenceManager.shared
-        var library = persistence.loadLibrary()
+        let library = persistence.loadLibrary()
 
         // Get included podcast feed URLs
-        let includedFeedURLs = Set(library.podcasts
-            .map(\.feedURL)
-            .filter { !excludedFeedURLs.contains($0) })
+        let includedFeedURLs = Set(
+            library.podcasts
+                .map(\.feedURL)
+                .filter { !excludedFeedURLs.contains($0) })
 
         // Clean rotation: remove feed URLs no longer in the included set
         var rotation = library.crownPodcastRotation.filter { includedFeedURLs.contains($0) }
@@ -120,11 +104,7 @@ final class RemoteCommandHandler {
         while !rotation.isEmpty {
             let feedURL = rotation.removeFirst()
             guard let episodes = persistence.cachedEpisodes(for: feedURL) else { continue }
-            let eligible = episodes.filter { episode in
-                guard let timestamp = episode.pubDateTimestamp else { return true }
-                return timestamp < cutoffTimestamp
-            }
-            if let episode = eligible.randomElement() {
+            if let episode = episodes.olderThan(days: ageDays).randomElement() {
                 selectedEpisode = episode
                 selectedFeedURL = feedURL
                 break
@@ -132,16 +112,15 @@ final class RemoteCommandHandler {
         }
 
         // Save updated rotation
-        library.crownPodcastRotation = rotation
-        persistence.saveLibrary(library)
+        persistence.update { library in
+            library.crownPodcastRotation = rotation
+        }
 
         guard let random = selectedEpisode else {
             isCrownActionActive = false
             return
         }
-        let wasPlaying = AudioPlayer.shared.isPlaying
-        if wasPlaying { AudioPlayer.shared.pausePlayback() }
-        SpeechAnnouncer.shared.speak("\(random.podcastTitle). \(random.title)") { [weak self] in
+        AudioPlayer.shared.pauseThenSpeak("\(random.podcastTitle). \(random.title)") { [weak self] _ in
             Task { @MainActor [weak self] in
                 self?.isCrownActionActive = false
                 AudioPlayer.shared.currentFeedURL = selectedFeedURL

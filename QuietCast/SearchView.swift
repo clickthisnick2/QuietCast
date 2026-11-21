@@ -54,9 +54,10 @@ struct SearchView: View {
                 if isSearching {
                     ProgressView()
                 } else if let searchError {
-                    ContentUnavailableView(searchError,
-                                           systemImage: "wifi.slash",
-                                           description: Text("Check your connection and try again."))
+                    ContentUnavailableView(
+                        searchError,
+                        systemImage: "wifi.slash",
+                        description: Text("Check your connection and try again."))
                 } else if results.isEmpty && hasSearched {
                     ContentUnavailableView.search(text: searchText)
                 }
@@ -72,7 +73,9 @@ struct SearchView: View {
         Task {
             do {
                 results = try await iTunesSearchService.search(term: searchText)
-            } catch let error as URLError where error.code == .notConnectedToInternet || error.code == .networkConnectionLost {
+            } catch let error as URLError
+                where error.code == .notConnectedToInternet || error.code == .networkConnectionLost
+            {
                 results = []
                 searchError = "No Internet Connection"
             } catch {
@@ -87,9 +90,9 @@ struct SearchView: View {
     private func addPodcast(_ podcast: Podcast) {
         guard !podcasts.contains(where: { $0.feedURL == podcast.feedURL }) else { return }
         podcasts.append(podcast)
-        var library = PersistenceManager.shared.loadLibrary()
-        library.podcasts = podcasts
-        PersistenceManager.shared.saveLibrary(library)
+        PersistenceManager.shared.update { library in
+            library.podcasts = podcasts
+        }
         dismiss()
     }
 }

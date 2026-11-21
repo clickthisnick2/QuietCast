@@ -7,9 +7,7 @@ struct EpisodeListView: View {
     @State private var episodes: [Episode] = []
     @State private var isLoading = true
     @State private var errorMessage: String?
-    @State private var isRefreshing = false
     @State private var skipIntroSeconds: Int?
-    private let skipIntroOptions = [0, 10, 15, 30, 45, 60, 90, 120]
 
     var body: some View {
         ZStack(alignment: .bottom) {
@@ -17,13 +15,15 @@ struct EpisodeListView: View {
                 if isLoading && episodes.isEmpty {
                     ProgressView("Loading episodes…")
                 } else if let errorMessage, episodes.isEmpty {
-                    ContentUnavailableView("Failed to Load",
-                                           systemImage: "exclamationmark.triangle",
-                                           description: Text(errorMessage))
+                    ContentUnavailableView(
+                        "Failed to Load",
+                        systemImage: "exclamationmark.triangle",
+                        description: Text(errorMessage))
                 } else if episodes.isEmpty {
-                    ContentUnavailableView("No Episodes",
-                                           systemImage: "mic.slash",
-                                           description: Text("This podcast has no episodes."))
+                    ContentUnavailableView(
+                        "No Episodes",
+                        systemImage: "mic.slash",
+                        description: Text("This podcast has no episodes."))
                 } else {
                     episodeList
                 }
@@ -45,14 +45,14 @@ struct EpisodeListView: View {
                             PersistenceManager.shared.setSkipSeconds(nil, for: podcast.feedURL)
                         } label: {
                             HStack {
-                                let d = AppSettings.defaultSkipIntroSeconds
+                                let d = AppSettings.shared.defaultSkipIntroSeconds
                                 Text("Default (\(d == 0 ? "Off" : "\(d)s"))")
                                 if skipIntroSeconds == nil {
                                     Image(systemName: "checkmark")
                                 }
                             }
                         }
-                        ForEach(skipIntroOptions, id: \.self) { seconds in
+                        ForEach(AppSettings.skipIntroOptions, id: \.self) { seconds in
                             Button {
                                 skipIntroSeconds = seconds
                                 PersistenceManager.shared.setSkipSeconds(seconds, for: podcast.feedURL)
@@ -115,19 +115,7 @@ struct EpisodeListView: View {
     private func playRandomOldEpisode() {
         // Stop any text-to-speech before starting audio
         SpeechAnnouncer.shared.stop()
-
-        let ageDays = AppSettings.randomEpisodeAgeDays
-        let cutoff = Calendar.current.date(byAdding: .day, value: -ageDays, to: Date()) ?? Date()
-        let cutoffTimestamp = cutoff.timeIntervalSince1970
-
-        let eligible = episodes.filter { episode in
-            guard let timestamp = episode.pubDateTimestamp else {
-                // If we can't parse the date, include it (likely an old episode with unusual format)
-                return true
-            }
-            return timestamp < cutoffTimestamp
-        }
-
+        let eligible = episodes.olderThan(days: AppSettings.shared.randomEpisodeAgeDays)
         if let random = eligible.randomElement() {
             audioPlayer.play(episode: random)
         }
@@ -140,57 +128,51 @@ struct EpisodeListView: View {
     }
 
     private func fetchEpisodes() async {
-        guard let url = URL(string: podcast.feedURL) else {
-            if episodes.isEmpty {
-                errorMessage = "Invalid feed URL."
-            }
-            isLoading = false
-            return
-        }
-
+        defer { isLoading = false }
         do {
-            var request = URLRequest(url: url)
-            request.setValue("identity", forHTTPHeaderField: "Accept-Encoding")
-            request.setValue("Mozilla/5.0", forHTTPHeaderField: "User-Agent")
-            request.timeoutInterval = 15
-
-            let (data, response) = try await URLSession.shared.data(for: request)
-
-            // Check if the server returned HTML instead of XML/RSS
-            if let httpResponse = response as? HTTPURLResponse,
-               let contentType = httpResponse.value(forHTTPHeaderField: "Content-Type"),
-               contentType.contains("text/html") {
+            let feed = try await FeedService.load(feedURL: podcast.feedURL)
+            if let contentType = feed.contentType, contentType.contains("text/html") {
                 if episodes.isEmpty {
                     errorMessage = "This URL returned a webpage, not an RSS feed."
                 }
-                isLoading = false
                 return
             }
-
-            let parser = RSSParser(feedURL: podcast.feedURL)
-            let parsed = parser.parse(data: data)
-            if !parsed.isEmpty {
-                episodes = parsed
+            if !feed.episodes.isEmpty {
+                episodes = feed.episodes
                 errorMessage = nil
-                PersistenceManager.shared.cacheEpisodes(parsed, for: podcast.feedURL)
+                PersistenceManager.shared.cacheEpisodes(feed.episodes, for: podcast.feedURL)
             } else if episodes.isEmpty {
                 errorMessage = "No episodes found. The feed may be empty or in an unsupported format."
             }
-        } catch {
-            // Only show error if we have no cached episodes to display
+        } catch FeedError.invalidURL {
             if episodes.isEmpty {
-                if let urlError = error as? URLError,
-                   urlError.code == .notConnectedToInternet || urlError.code == .networkConnectionLost {
-                    errorMessage = "No internet connection. Connect to a network and pull to refresh."
-                } else if let urlError = error as? URLError, urlError.code == .timedOut {
-                    errorMessage = "The request timed out. Pull to refresh to try again."
-                } else {
-                    errorMessage = error.localizedDescription
-                }
+                errorMessage = "Invalid feed URL."
             }
-            // If we have cached episodes, silently fail — user can pull to refresh
+        } catch FeedError.httpStatus(let code) {
+            if episodes.isEmpty {
+                errorMessage = "The feed server returned an error (\(code)). Pull to refresh to try again."
+            }
+        } catch FeedError.notHTTP {
+            if episodes.isEmpty {
+                errorMessage = "The feed server returned an unexpected response. Pull to refresh to try again."
+            }
+        } catch FeedError.offline {
+            if episodes.isEmpty {
+                errorMessage = "No internet connection. Connect to a network and pull to refresh."
+            }
+        } catch FeedError.timedOut {
+            if episodes.isEmpty {
+                errorMessage = "The request timed out. Pull to refresh to try again."
+            }
+        } catch FeedError.other(let message) {
+            if episodes.isEmpty {
+                errorMessage = message
+            }
+        } catch {
+            if episodes.isEmpty {
+                errorMessage = error.localizedDescription
+            }
         }
-        isLoading = false
     }
 }
 
@@ -244,7 +226,7 @@ struct EpisodeRow: View {
                     Text("New")
                         .foregroundStyle(Color.warmAccent)
                 case .inProgress(let secs):
-                    Text("\(formatResumeTime(secs)) in")
+                    Text("\(PlaybackText.hoursMinutes(secs)) in")
                         .foregroundStyle(Color.warmAccent)
                 case .played:
                     Text("Played")
@@ -298,10 +280,12 @@ struct EpisodeRow: View {
                 Button {
                     toggleSpeakEpisode()
                 } label: {
-                    Label(isThisEpisodeSpeaking ? "Speaking…" : "Speak",
-                          systemImage: isThisEpisodeSpeaking ? "speaker.wave.3.fill" : "speaker.wave.2")
-                        .font(.caption)
-                        .foregroundStyle(isThisEpisodeSpeaking ? Color.warmAccent : Color.secondary)
+                    Label(
+                        isThisEpisodeSpeaking ? "Speaking…" : "Speak",
+                        systemImage: isThisEpisodeSpeaking ? "speaker.wave.3.fill" : "speaker.wave.2"
+                    )
+                    .font(.caption)
+                    .foregroundStyle(isThisEpisodeSpeaking ? Color.warmAccent : Color.secondary)
                 }
                 .buttonStyle(.borderless)
 
@@ -384,25 +368,10 @@ struct EpisodeRow: View {
         }
 
         // Pause playback so the announcement is audible.
-        let wasPlaying = audioPlayer.isPlaying
-        if wasPlaying {
-            audioPlayer.pausePlayback()
-        }
-
-        announcer.speak(text, identifier: episode.guid) {
+        audioPlayer.pauseThenSpeak(text, identifier: episode.guid) { wasPlaying in
             if wasPlaying {
                 self.audioPlayer.resumePlayback()
             }
         }
-    }
-
-    private func formatResumeTime(_ seconds: Double) -> String {
-        let total = max(Int(seconds), 0)
-        let h = total / 3600
-        let m = (total % 3600) / 60
-        if h > 0 {
-            return "\(h)h \(m)m"
-        }
-        return "\(m)m"
     }
 }

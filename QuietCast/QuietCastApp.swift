@@ -6,16 +6,21 @@
 //
 
 import SwiftUI
-import AVFoundation
 import UIKit
 
 @main
 struct QuietCastApp: App {
+    @UIApplicationDelegateAdaptor(QuietCastAppDelegate.self) private var appDelegate
     @Environment(\.scenePhase) private var scenePhase
     @State private var previousBrightness: CGFloat?
     @State private var hasSetupAudioSession = false
 
     init() {
+        // Recreate the background download session on every launch so a transfer
+        // that finished while the app was gone can be moved into place.
+        _ = DownloadManager.shared
+        AppSettings.shared.connectPlaybackReactions()
+
         // Flush saves on app termination (not always called, but helps when it is)
         NotificationCenter.default.addObserver(
             forName: UIApplication.willTerminateNotification,
@@ -33,9 +38,11 @@ struct QuietCastApp: App {
                 .tint(Color.warmAccent)
         }
         .onChange(of: scenePhase) { _, phase in
-            guard let screen = UIApplication.shared.connectedScenes
-                .compactMap({ $0 as? UIWindowScene })
-                .first?.screen else { return }
+            guard
+                let screen = UIApplication.shared.connectedScenes
+                    .compactMap({ $0 as? UIWindowScene })
+                    .first?.screen
+            else { return }
 
             switch phase {
             case .active:
@@ -48,7 +55,7 @@ struct QuietCastApp: App {
                 // Re-enable volume lock if a scheduled re-enable time has passed
                 AudioPlayer.shared.checkVolumeRangeReenableSchedule()
 
-                // Only dim during nighttime hours (8 PM – 8 AM)
+                // Only dim during nighttime hours (TimeGate.nightHoursText)
                 if !TimeGate.searchAllowed() {
                     if previousBrightness == nil {
                         previousBrightness = screen.brightness
@@ -57,21 +64,15 @@ struct QuietCastApp: App {
                     screen.brightness = dimmed
                 }
 
-                // Enforce system volume range on app open (nighttime or always-on)
-                let shouldEnforce = !TimeGate.searchAllowed() || AppSettings.volumeRangeAlwaysOn
-                if shouldEnforce && AudioPlayer.shared.systemVolumeCapEnabled {
+                // Enforce system volume range on app open when the lock is on.
+                // VolumeEnforcer applies the nighttime / always-on check itself.
+                if AppSettings.shared.systemVolumeCapEnabled {
                     let enforcer = VolumeEnforcer.shared
                     enforcer.installVolumeView()
                     // Small delay to let the volume view attach
                     DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
-                        let current = AVAudioSession.sharedInstance().outputVolume
-                        let cap = AppSettings.systemVolumeCap
-                        let floor = AppSettings.systemVolumeFloor
-                        if current > cap {
-                            enforcer.setMaxSystemVolume()
-                        } else if current < floor {
-                            enforcer.setMinSystemVolume()
-                        }
+                        enforcer.enforceSystemVolumeCap()
+                        enforcer.enforceSystemVolumeFloor()
                     }
                 }
             case .inactive, .background:
@@ -84,6 +85,25 @@ struct QuietCastApp: App {
             @unknown default:
                 break
             }
+        }
+    }
+}
+
+/// Receives background URLSession relaunch events for episode downloads.
+final class QuietCastAppDelegate: NSObject, UIApplicationDelegate {
+    func application(
+        _ application: UIApplication,
+        handleEventsForBackgroundURLSession identifier: String,
+        completionHandler: @escaping () -> Void
+    ) {
+        guard identifier == "com.quietcast.downloads" else {
+            completionHandler()
+            return
+        }
+        // UIKit calls this on the main thread. The session has to exist
+        // before we return or the system drops the events.
+        MainActor.assumeIsolated {
+            DownloadManager.connectBackgroundSession(completionHandler)
         }
     }
 }

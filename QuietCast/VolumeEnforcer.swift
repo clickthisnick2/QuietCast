@@ -1,8 +1,9 @@
 import AVFoundation
 import MediaPlayer
-import os
+import Observation
 
 /// Manages system volume enforcement: cap, floor, KVO observation, hidden MPVolumeView.
+@Observable
 @MainActor
 final class VolumeEnforcer {
     static let shared = VolumeEnforcer()
@@ -13,13 +14,12 @@ final class VolumeEnforcer {
     private var volumeView: MPVolumeView?
     private var volumeSlider: UISlider?
     private var volumeEnforcementTask: Task<Void, Never>?
-    private let logger = Logger(subsystem: "com.quietcast", category: "VolumeEnforcer")
 
     private init() {}
 
     /// Whether volume enforcement is active: nighttime hours OR always-on override.
     private static var shouldEnforce: Bool {
-        TimeGate.isNighttime() || AppSettings.volumeRangeAlwaysOn
+        TimeGate.isNighttime() || AppSettings.shared.volumeRangeAlwaysOn
     }
 
     // MARK: - Setup
@@ -30,7 +30,8 @@ final class VolumeEnforcer {
         let view = MPVolumeView(frame: CGRect(x: -1000, y: -1000, width: 1, height: 1))
         view.alpha = 0.01
         if let windowScene = UIApplication.shared.connectedScenes.first as? UIWindowScene,
-           let window = windowScene.windows.first {
+            let window = windowScene.windows.first
+        {
             window.addSubview(view)
         }
         volumeView = view
@@ -48,10 +49,10 @@ final class VolumeEnforcer {
         currentSystemVolume = session.outputVolume
         volumeObservation = session.observe(\.outputVolume, options: [.new]) { [weak self] _, change in
             let newVolume = change.newValue ?? session.outputVolume
-            let capEnabled = AppSettings.systemVolumeCapEnabled
-            let cap = AppSettings.systemVolumeCap
-            let floor = AppSettings.systemVolumeFloor
             Task { @MainActor [weak self] in
+                let capEnabled = AppSettings.shared.systemVolumeCapEnabled
+                let cap = AppSettings.shared.systemVolumeCap
+                let floor = AppSettings.shared.systemVolumeFloor
                 if capEnabled && Self.shouldEnforce {
                     if newVolume > cap {
                         self?.volumeSlider?.value = cap
@@ -70,7 +71,7 @@ final class VolumeEnforcer {
 
     func enforceSystemVolumeCap() {
         guard Self.shouldEnforce else { return }
-        let cap = AppSettings.systemVolumeCap
+        let cap = AppSettings.shared.systemVolumeCap
         let current = AVAudioSession.sharedInstance().outputVolume
         if current > cap {
             setSystemVolume(cap)
@@ -79,21 +80,11 @@ final class VolumeEnforcer {
 
     func enforceSystemVolumeFloor() {
         guard Self.shouldEnforce else { return }
-        let floor = AppSettings.systemVolumeFloor
+        let floor = AppSettings.shared.systemVolumeFloor
         let current = AVAudioSession.sharedInstance().outputVolume
         if current < floor {
             setSystemVolume(floor)
         }
-    }
-
-    /// Push system volume down to the cap.
-    func setMaxSystemVolume() {
-        setSystemVolume(AppSettings.systemVolumeCap)
-    }
-
-    /// Push system volume up to the floor.
-    func setMinSystemVolume() {
-        setSystemVolume(AppSettings.systemVolumeFloor)
     }
 
     func setSystemVolume(_ volume: Float) {
@@ -106,8 +97,8 @@ final class VolumeEnforcer {
         volumeEnforcementTask?.cancel()
         volumeEnforcementTask = Task { @MainActor [weak self] in
             guard let self else { return }
-            let cap = AppSettings.systemVolumeCap
-            let floor = AppSettings.systemVolumeFloor
+            let cap = AppSettings.shared.systemVolumeCap
+            let floor = AppSettings.shared.systemVolumeFloor
             for _ in 0..<60 {
                 if Task.isCancelled || !Self.shouldEnforce { return }
                 let current = AVAudioSession.sharedInstance().outputVolume

@@ -11,33 +11,13 @@ final class AudioPlayer {
     var currentEpisode: Episode?
     var isPlaying = false
     var isBuffering = false
+    /// Set when the current item fails to play. Cleared on the next play attempt.
+    var playbackError: String?
     var currentTime: Double = 0
     var duration: Double = 0
-    var playbackRate: Float = 1.0
-    var sleepTimerRemaining: Double? = nil // seconds remaining, nil = off
+    var sleepTimerRemaining: Double? = nil  // seconds remaining, nil = off
     var sleepTimerActive: Bool { sleepTimerRemaining != nil }
-    var autoPlayNext = true
     var isScrubbing = false
-    var maxVolume: Float = 1.0 // 0.0–1.0, caps player output
-    var noiseCancellationOn: Bool = false
-    var systemVolumeCapNC: Float = 1.0
-    var systemVolumeFloorNC: Float = 0.0
-    var systemVolumeCapNoNC: Float = 1.0
-    var systemVolumeFloorNoNC: Float = 0.0
-    var systemVolumeCapEnabled: Bool = false
-    var volumeRangeAlwaysOn: Bool = false
-    var volumeRangeAutoReenableMinutes: Int = 120
-    var volumeRangeReenableAt: Date?
-
-    /// Active cap based on current NC mode.
-    var systemVolumeCap: Float {
-        noiseCancellationOn ? systemVolumeCapNC : systemVolumeCapNoNC
-    }
-
-    /// Active floor based on current NC mode.
-    var systemVolumeFloor: Float {
-        noiseCancellationOn ? systemVolumeFloorNC : systemVolumeFloorNoNC
-    }
     var currentSystemVolume: Float { VolumeEnforcer.shared.currentSystemVolume }
 
     /// The episode list for auto-play next; set when loading a podcast's episodes
@@ -55,77 +35,32 @@ final class AudioPlayer {
     private var sleepTimerTask: Task<Void, Never>?
     private var reenableTask: Task<Void, Never>?
     private var interruptionObserver: NSObjectProtocol?
+    private var routeChangeObserver: NSObjectProtocol?
+    private var itemStatusObservation: NSKeyValueObservation?
+    private var failedToEndObserver: NSObjectProtocol?
     private var fadeInTask: Task<Void, Never>?
 
     private init() {
-        autoPlayNext = AppSettings.autoPlayNext
-        maxVolume = AppSettings.maxVolume
-        playbackRate = AppSettings.playbackRate
-        noiseCancellationOn = AppSettings.noiseCancellationOn
-        systemVolumeCapNC = AppSettings.systemVolumeCapNC
-        systemVolumeFloorNC = AppSettings.systemVolumeFloorNC
-        systemVolumeCapNoNC = AppSettings.systemVolumeCapNoNC
-        systemVolumeFloorNoNC = AppSettings.systemVolumeFloorNoNC
-        systemVolumeCapEnabled = AppSettings.systemVolumeCapEnabled
-        volumeRangeAlwaysOn = AppSettings.volumeRangeAlwaysOn
-        volumeRangeAutoReenableMinutes = AppSettings.volumeRangeAutoReenableMinutes
-        volumeRangeReenableAt = AppSettings.volumeRangeReenableAt
         observeInterruptions()
+        observeRouteChanges()
     }
 
-    func setMaxVolume(_ value: Float) {
-        maxVolume = value
-        AppSettings.maxVolume = value
+    /// Caps in-app volume while audio is playing. Called when the volume limit changes.
+    func clampOutputToMaxVolume() {
+        guard isPlaying else { return }
+        player?.volume = min(player?.volume ?? 1.0, AppSettings.shared.maxVolume)
+    }
+
+    func applyPlaybackRate() {
         if isPlaying {
-            player?.volume = min(player?.volume ?? 1.0, maxVolume)
+            player?.rate = AppSettings.shared.playbackRate
         }
+        updateNowPlaying()
     }
 
-    func setSystemVolumeCapNC(_ value: Float) {
-        systemVolumeCapNC = value
-        AppSettings.systemVolumeCapNC = value
-        if noiseCancellationOn && systemVolumeCapEnabled {
-            VolumeEnforcer.shared.enforceSystemVolumeCap()
-        }
-    }
-
-    func setSystemVolumeFloorNC(_ value: Float) {
-        systemVolumeFloorNC = value
-        AppSettings.systemVolumeFloorNC = value
-        if noiseCancellationOn && systemVolumeCapEnabled {
-            VolumeEnforcer.shared.enforceSystemVolumeFloor()
-        }
-    }
-
-    func setSystemVolumeCapNoNC(_ value: Float) {
-        systemVolumeCapNoNC = value
-        AppSettings.systemVolumeCapNoNC = value
-        if !noiseCancellationOn && systemVolumeCapEnabled {
-            VolumeEnforcer.shared.enforceSystemVolumeCap()
-        }
-    }
-
-    func setSystemVolumeFloorNoNC(_ value: Float) {
-        systemVolumeFloorNoNC = value
-        AppSettings.systemVolumeFloorNoNC = value
-        if !noiseCancellationOn && systemVolumeCapEnabled {
-            VolumeEnforcer.shared.enforceSystemVolumeFloor()
-        }
-    }
-
-    func setNoiseCancellation(_ on: Bool) {
-        noiseCancellationOn = on
-        AppSettings.noiseCancellationOn = on
-        if systemVolumeCapEnabled {
-            VolumeEnforcer.shared.enforceSystemVolumeCap()
-            VolumeEnforcer.shared.enforceSystemVolumeFloor()
-        }
-    }
-
-    func setSystemVolumeCapEnabled(_ enabled: Bool) {
-        systemVolumeCapEnabled = enabled
-        AppSettings.systemVolumeCapEnabled = enabled
-        if enabled {
+    /// Lock Volume Range was toggled. Enforce, or arm the auto re-enable timer.
+    func systemVolumeLockChanged() {
+        if AppSettings.shared.systemVolumeCapEnabled {
             cancelVolumeRangeReenable()
             VolumeEnforcer.shared.enforceSystemVolumeCap()
         } else {
@@ -133,41 +68,24 @@ final class AudioPlayer {
         }
     }
 
-    func setVolumeRangeAlwaysOn(_ enabled: Bool) {
-        volumeRangeAlwaysOn = enabled
-        AppSettings.volumeRangeAlwaysOn = enabled
-        if enabled && systemVolumeCapEnabled {
-            VolumeEnforcer.shared.enforceSystemVolumeCap()
-            VolumeEnforcer.shared.enforceSystemVolumeFloor()
-        }
-    }
-
-    func setVolumeRangeAutoReenableMinutes(_ minutes: Int) {
-        volumeRangeAutoReenableMinutes = minutes
-        AppSettings.volumeRangeAutoReenableMinutes = minutes
-        if !systemVolumeCapEnabled {
-            scheduleVolumeRangeReenableIfNeeded()
-        }
-    }
-
     /// If a re-enable was scheduled and its time has passed, turn Lock Volume Range back on.
     func checkVolumeRangeReenableSchedule() {
-        guard !systemVolumeCapEnabled,
-              let scheduled = volumeRangeReenableAt,
-              scheduled <= Date() else { return }
-        setSystemVolumeCapEnabled(true)
+        guard !AppSettings.shared.systemVolumeCapEnabled,
+            let scheduled = AppSettings.shared.volumeRangeReenableAt,
+            scheduled <= Date()
+        else { return }
+        AppSettings.shared.systemVolumeCapEnabled = true
     }
 
-    private func scheduleVolumeRangeReenableIfNeeded() {
-        let minutes = volumeRangeAutoReenableMinutes
+    func scheduleVolumeRangeReenableIfNeeded() {
+        let minutes = AppSettings.shared.volumeRangeAutoReenableMinutes
         guard minutes > 0 else {
             cancelVolumeRangeReenable()
             return
         }
 
         let reenableDate = Date().addingTimeInterval(TimeInterval(minutes * 60))
-        volumeRangeReenableAt = reenableDate
-        AppSettings.volumeRangeReenableAt = reenableDate
+        AppSettings.shared.volumeRangeReenableAt = reenableDate
 
         reenableTask?.cancel()
         reenableTask = Task { @MainActor [weak self] in
@@ -181,8 +99,7 @@ final class AudioPlayer {
     private func cancelVolumeRangeReenable() {
         reenableTask?.cancel()
         reenableTask = nil
-        volumeRangeReenableAt = nil
-        AppSettings.volumeRangeReenableAt = nil
+        AppSettings.shared.volumeRangeReenableAt = nil
     }
 
     func setupAudioSession() {
@@ -226,6 +143,7 @@ final class AudioPlayer {
     }
 
     func play(episode: Episode, rearmAutoPause: Bool = true) {
+        playbackError = nil
         let url: URL
         let persistence = PersistenceManager.shared
         if persistence.isDownloaded(episode) {
@@ -235,29 +153,22 @@ final class AudioPlayer {
             url = streamURL
         }
 
-        if currentEpisode?.guid == episode.guid, let player {
-            fadeIn(player: player)
-            player.rate = playbackRate
-            isPlaying = true
-            if systemVolumeCapEnabled { VolumeEnforcer.shared.enforceSystemVolumeCap() }
-            updateNowPlaying()
-            if rearmAutoPause { armAutoPauseTimerIfNeeded() }
+        if currentEpisode?.guid == episode.guid, player != nil {
+            resumeCurrentEpisode(armTimer: rearmAutoPause)
             return
         }
 
         // Save position of the episode we're leaving
         saveCurrentPosition()
 
-        removeTimeObserver()
-        removeEndOfEpisodeObserver()
-        statusObservation?.invalidate()
+        tearDownCurrentItem()
         let item = AVPlayerItem(url: url)
         player = AVPlayer(playerItem: item)
         player?.volume = 0
         currentEpisode = episode
         isPlaying = true
         isBuffering = true
-        if systemVolumeCapEnabled { VolumeEnforcer.shared.enforceSystemVolumeCap() }
+        if AppSettings.shared.systemVolumeCapEnabled { VolumeEnforcer.shared.enforceSystemVolumeCap() }
         addEndOfEpisodeObserver(for: item)
         observeBufferingStatus()
 
@@ -267,22 +178,10 @@ final class AudioPlayer {
         if savedPosition > 0 {
             startPosition = savedPosition
         } else {
-            startPosition = introSkipSeconds(for: episode)
+            startPosition = introSkipSeconds()
         }
 
-        if startPosition > 0 {
-            player?.seek(to: CMTimeMakeWithSeconds(startPosition, preferredTimescale: 600)) { [weak self] _ in
-                Task { @MainActor [weak self] in
-                    guard let self, let player = self.player else { return }
-                    player.rate = self.playbackRate
-                    self.fadeIn(player: player)
-                }
-            }
-        } else {
-            player?.rate = playbackRate
-            if let player { fadeIn(player: player) }
-        }
-
+        beginAudiblePlayback(at: startPosition)
         addTimeObserver()
         updateNowPlaying()
         if rearmAutoPause {
@@ -304,82 +203,86 @@ final class AudioPlayer {
 
     /// Resume the AVPlayer at the current playback rate (used by speech announcements).
     func resumePlayback() {
-        player?.rate = playbackRate
+        player?.rate = AppSettings.shared.playbackRate
         armAutoPauseTimerIfNeeded()
     }
 
     /// Resume the AVPlayer without resetting the sleep timer.
     func resumePlaybackWithoutResettingTimer() {
-        player?.rate = playbackRate
+        player?.rate = AppSettings.shared.playbackRate
     }
 
     func togglePlayPause() {
         if isPlaying {
             pause()
-        } else if currentEpisode != nil {
-            if let player {
-                fadeIn(player: player)
-            }
-            player?.rate = playbackRate
-            isPlaying = true
-            if systemVolumeCapEnabled { VolumeEnforcer.shared.enforceSystemVolumeCap() }
-            updateNowPlaying()
-            // Preserve any in-flight countdown (manual sleep timer or auto-pause).
-            // Only arm a fresh timer when no countdown is active.
-            if sleepTimerRemaining == nil {
-                armAutoPauseTimerIfNeeded()
-            }
+        } else {
+            play()
+        }
+    }
+
+    /// Headset play. Does not pause when audio is already playing.
+    func play() {
+        guard !isPlaying, currentEpisode != nil else { return }
+        // Preserve any in-flight countdown (manual sleep timer or auto-pause).
+        // Only arm a fresh timer when no countdown is active.
+        resumeCurrentEpisode(armTimer: sleepTimerRemaining == nil)
+    }
+
+    /// Fade in the loaded episode, mark it playing, and optionally arm auto-pause.
+    private func resumeCurrentEpisode(armTimer: Bool) {
+        if let player {
+            fadeIn(player: player)
+        }
+        player?.rate = AppSettings.shared.playbackRate
+        isPlaying = true
+        if AppSettings.shared.systemVolumeCapEnabled { VolumeEnforcer.shared.enforceSystemVolumeCap() }
+        updateNowPlaying()
+        if armTimer { armAutoPauseTimerIfNeeded() }
+    }
+
+    /// Pause for speech, then run `completion` with whether audio was playing.
+    /// Callers that touch player state hop back to the main actor themselves.
+    func pauseThenSpeak(_ text: String, identifier: String? = nil, completion: @escaping (_ wasPlaying: Bool) -> Void) {
+        let wasPlaying = isPlaying
+        if wasPlaying { pausePlayback() }
+        SpeechAnnouncer.shared.speak(text, identifier: identifier) {
+            completion(wasPlaying)
         }
     }
 
     // MARK: - Volume
 
-    func setAutoPlayNext(_ enabled: Bool) {
-        autoPlayNext = enabled
-        AppSettings.autoPlayNext = enabled
-    }
-
     /// Gentle 1.5-second fade-in
     private func fadeIn(player: AVPlayer) {
         fadeInTask?.cancel()
         player.volume = 0
-        fadeInTask = Task { @MainActor in
+        let task = Task { @MainActor [weak self] in
             let steps = 15
             let interval = 1.5 / Double(steps)
             for i in 1...steps {
                 try? await Task.sleep(nanoseconds: UInt64(interval * 1_000_000_000))
                 if Task.isCancelled { return }
-                player.volume = min(Float(i) / Float(steps), self.maxVolume)
+                player.volume = min(Float(i) / Float(steps), AppSettings.shared.maxVolume)
+            }
+            if !Task.isCancelled {
+                self?.fadeInTask = nil
             }
         }
+        fadeInTask = task
     }
 
     private var isSeeking = false
 
     func skipForward() {
-        guard let player else { return }
-        let target = min(currentTime + 30, duration)
-        currentTime = target
-        isSeeking = true
-        player.seek(to: CMTimeMakeWithSeconds(target, preferredTimescale: 600)) { [weak self] _ in
-            Task { @MainActor [weak self] in
-                self?.isSeeking = false
-            }
-        }
-        updateNowPlaying()
+        // duration stays 0 until the item reports a real length. Clamping to it
+        // seeks back to 0:00, so skip from the current time while it is unknown.
+        let unclamped = currentTime + Double(AppSettings.skipIntervalSeconds)
+        let target = duration > 0 ? min(unclamped, duration) : unclamped
+        seek(to: target)
     }
 
     func skipBackward() {
-        guard let player else { return }
-        let target = max(currentTime - 30, 0)
-        currentTime = target
-        isSeeking = true
-        player.seek(to: CMTimeMakeWithSeconds(target, preferredTimescale: 600)) { [weak self] _ in
-            Task { @MainActor [weak self] in
-                self?.isSeeking = false
-            }
-        }
-        updateNowPlaying()
+        seek(to: max(currentTime - Double(AppSettings.skipIntervalSeconds), 0))
     }
 
     func seek(to time: Double) {
@@ -394,21 +297,12 @@ final class AudioPlayer {
         updateNowPlaying()
     }
 
-    func setRate(_ rate: Float) {
-        playbackRate = rate
-        AppSettings.playbackRate = rate
-        if isPlaying {
-            player?.rate = rate
-        }
-        updateNowPlaying()
-    }
-
     // MARK: - Sleep Timer
 
     /// Auto-Pause: arms (or restarts) the timer whenever playback starts or resumes.
     private func armAutoPauseTimerIfNeeded() {
-        let minutes = AppSettings.autoPauseMinutes
-        guard minutes > 0 else { return } // Auto-pause off — leave manual timers alone
+        let minutes = AppSettings.shared.autoPauseMinutes
+        guard minutes > 0 else { return }  // Auto-pause off — leave manual timers alone
         setSleepTimer(minutes: minutes)
     }
 
@@ -418,17 +312,17 @@ final class AudioPlayer {
 
         sleepTimerTask = Task { [weak self] in
             while let self, let remaining = self.sleepTimerRemaining, remaining > 0 {
-                try? await Task.sleep(nanoseconds: 1_000_000_000) // 1 second
+                try? await Task.sleep(nanoseconds: 1_000_000_000)  // 1 second
                 if Task.isCancelled { return }
                 self.sleepTimerRemaining = max(0, remaining - 1)
 
                 // Fade volume in last 30 seconds: from maxVolume down to 0
                 if remaining <= 30 {
-                    self.player?.volume = self.maxVolume * Float(remaining / 30.0)
+                    self.player?.volume = AppSettings.shared.maxVolume * Float(remaining / 30.0)
                 }
 
                 if remaining <= 1 {
-                    self.player?.volume = self.maxVolume
+                    self.player?.volume = AppSettings.shared.maxVolume
                     self.pause()
                     self.sleepTimerRemaining = nil
                     return
@@ -441,7 +335,11 @@ final class AudioPlayer {
         sleepTimerTask?.cancel()
         sleepTimerTask = nil
         sleepTimerRemaining = nil
-        player?.volume = maxVolume
+        // Arming auto-pause calls this immediately after fadeIn starts. Restoring
+        // max volume here cancels the fade. Leave the ramp alone while it is running.
+        if fadeInTask == nil {
+            player?.volume = AppSettings.shared.maxVolume
+        }
     }
 
     // MARK: - Time Observer
@@ -473,6 +371,29 @@ final class AudioPlayer {
         if let observer = timeObserver {
             player?.removeTimeObserver(observer)
             timeObserver = nil
+        }
+    }
+
+    private func tearDownCurrentItem() {
+        removeTimeObserver()
+        removeEndOfEpisodeObserver()
+        clearItemObservations()
+    }
+
+    /// Start audible playback immediately, or after seeking to a saved position.
+    private func beginAudiblePlayback(at position: Double) {
+        guard let player else { return }
+        if position > 0 {
+            player.seek(to: CMTimeMakeWithSeconds(position, preferredTimescale: 600)) { [weak self] _ in
+                Task { @MainActor [weak self] in
+                    guard let self, let player = self.player else { return }
+                    player.rate = AppSettings.shared.playbackRate
+                    self.fadeIn(player: player)
+                }
+            }
+        } else {
+            player.rate = AppSettings.shared.playbackRate
+            fadeIn(player: player)
         }
     }
 
@@ -511,14 +432,12 @@ final class AudioPlayer {
         }
 
         // Auto-play next episode
-        if autoPlayNext, let finished = finishedEpisode,
-           let currentIndex = episodeList.firstIndex(where: { $0.guid == finished.guid }),
-           currentIndex + 1 < episodeList.count {
+        if AppSettings.shared.autoPlayNext, let finished = finishedEpisode,
+            let currentIndex = episodeList.firstIndex(where: { $0.guid == finished.guid }),
+            currentIndex + 1 < episodeList.count
+        {
             let nextEpisode = episodeList[currentIndex + 1]
-            removeTimeObserver()
-            removeEndOfEpisodeObserver()
-            statusObservation?.invalidate()
-            statusObservation = nil
+            tearDownCurrentItem()
             currentEpisode = nil
             player = nil
             play(episode: nextEpisode, rearmAutoPause: false)
@@ -529,10 +448,7 @@ final class AudioPlayer {
         isBuffering = false
         currentTime = 0
         duration = 0
-        removeTimeObserver()
-        removeEndOfEpisodeObserver()
-        statusObservation?.invalidate()
-        statusObservation = nil
+        tearDownCurrentItem()
         currentEpisode = nil
         player = nil
         MPNowPlayingInfoCenter.default().nowPlayingInfo = nil
@@ -548,6 +464,58 @@ final class AudioPlayer {
                 self.isBuffering = player.timeControlStatus == .waitingToPlayAtSpecifiedRate
             }
         }
+
+        itemStatusObservation?.invalidate()
+        if let failedToEndObserver {
+            NotificationCenter.default.removeObserver(failedToEndObserver)
+            self.failedToEndObserver = nil
+        }
+        guard let item = player?.currentItem else { return }
+
+        itemStatusObservation = item.observe(\.status, options: [.new]) { [weak self] item, _ in
+            guard item.status == .failed else { return }
+            let message = item.error?.localizedDescription
+            Task { @MainActor [weak self] in
+                self?.handlePlaybackFailure(message)
+            }
+        }
+        failedToEndObserver = NotificationCenter.default.addObserver(
+            forName: AVPlayerItem.failedToPlayToEndTimeNotification,
+            object: item,
+            queue: .main
+        ) { [weak self] notification in
+            let message = (notification.userInfo?[AVPlayerItemFailedToPlayToEndTimeErrorKey] as? Error)?
+                .localizedDescription
+            Task { @MainActor [weak self] in
+                self?.handlePlaybackFailure(message)
+            }
+        }
+    }
+
+    private func clearItemObservations() {
+        statusObservation?.invalidate()
+        statusObservation = nil
+        itemStatusObservation?.invalidate()
+        itemStatusObservation = nil
+        if let failedToEndObserver {
+            NotificationCenter.default.removeObserver(failedToEndObserver)
+            self.failedToEndObserver = nil
+        }
+    }
+
+    private func handlePlaybackFailure(_ message: String?) {
+        guard currentEpisode != nil else { return }
+        isBuffering = false
+        isPlaying = false
+        player?.pause()
+        if playbackError == nil {
+            if let message, !message.isEmpty {
+                playbackError = message
+            } else {
+                playbackError = "This episode couldn't be played."
+            }
+        }
+        updateNowPlaying()
     }
 
     // MARK: - Position Persistence
@@ -555,27 +523,24 @@ final class AudioPlayer {
     private func saveCurrentPosition() {
         guard let episode = currentEpisode, currentTime > 0 else { return }
         lastSavedTime = currentTime
-        let persistence = PersistenceManager.shared
-        persistence.savePlaybackPosition(currentTime, for: episode.guid)
-
-        // Persist last played episode for resume on next launch
-        if let feedURL = feedURLForCurrentEpisode() {
-            persistence.saveLastPlayedEpisode(guid: episode.guid, feedURL: feedURL)
-        }
+        PersistenceManager.shared.savePlaybackProgress(
+            seconds: currentTime,
+            guid: episode.guid,
+            feedURL: feedURLForCurrentEpisode()
+        )
     }
 
     // MARK: - Intro Skip
 
-    /// Returns the intro skip duration for the given episode's podcast, or the global default.
-    /// Returns 0 if no skip is configured.
-    private func introSkipSeconds(for episode: Episode) -> Double {
+    /// Intro skip for the current podcast, or the global default. Returns 0 when skip is off.
+    private func introSkipSeconds() -> Double {
         if let feedURL = feedURLForCurrentEpisode() {
             let library = PersistenceManager.shared.loadLibrary()
             if let custom = library.podcastSkipSeconds[feedURL] {
                 return Double(custom)
             }
         }
-        return Double(AppSettings.defaultSkipIntroSeconds)
+        return Double(AppSettings.shared.defaultSkipIntroSeconds)
     }
 
     /// Resolve the feed URL for the currently playing episode.
@@ -586,7 +551,8 @@ final class AudioPlayer {
         // Fallback: match by podcast title
         let library = PersistenceManager.shared.loadLibrary()
         if let episode = currentEpisode,
-           let podcast = library.podcasts.first(where: { $0.title == episode.podcastTitle }) {
+            let podcast = library.podcasts.first(where: { $0.title == episode.podcastTitle })
+        {
             return podcast.feedURL
         }
         return nil
@@ -600,7 +566,7 @@ final class AudioPlayer {
         info[MPMediaItemPropertyArtist] = currentEpisode?.podcastTitle ?? ""
         info[MPNowPlayingInfoPropertyElapsedPlaybackTime] = currentTime
         info[MPMediaItemPropertyPlaybackDuration] = duration
-        info[MPNowPlayingInfoPropertyPlaybackRate] = isPlaying ? playbackRate : 0.0
+        info[MPNowPlayingInfoPropertyPlaybackRate] = isPlaying ? AppSettings.shared.playbackRate : 0.0
         MPNowPlayingInfoCenter.default().nowPlayingInfo = info
     }
 
@@ -614,9 +580,10 @@ final class AudioPlayer {
         ) { [weak self] notification in
             Task { @MainActor [weak self] in
                 guard let self,
-                      let userInfo = notification.userInfo,
-                      let rawType = (userInfo[AVAudioSessionInterruptionTypeKey] as? NSNumber)?.uintValue,
-                      let type = AVAudioSession.InterruptionType(rawValue: rawType) else { return }
+                    let userInfo = notification.userInfo,
+                    let rawType = (userInfo[AVAudioSessionInterruptionTypeKey] as? NSNumber)?.uintValue,
+                    let type = AVAudioSession.InterruptionType(rawValue: rawType)
+                else { return }
 
                 switch type {
                 case .began:
@@ -627,7 +594,7 @@ final class AudioPlayer {
                     let rawOptions = (userInfo[AVAudioSessionInterruptionOptionKey] as? NSNumber)?.uintValue ?? 0
                     let options = AVAudioSession.InterruptionOptions(rawValue: rawOptions)
                     if options.contains(.shouldResume), self.currentEpisode != nil {
-                        self.player?.rate = self.playbackRate
+                        self.player?.rate = AppSettings.shared.playbackRate
                         self.isPlaying = true
                         self.updateNowPlaying()
                         self.armAutoPauseTimerIfNeeded()
@@ -637,5 +604,42 @@ final class AudioPlayer {
                 }
             }
         }
+    }
+
+    /// Headphones unplugged (or another output removed). iOS pauses playback;
+    /// keep the transport in sync so it doesn't stay on the pause icon.
+    private func observeRouteChanges() {
+        routeChangeObserver = NotificationCenter.default.addObserver(
+            forName: AVAudioSession.routeChangeNotification,
+            object: AVAudioSession.sharedInstance(),
+            queue: .main
+        ) { [weak self] notification in
+            Task { @MainActor [weak self] in
+                guard let self,
+                    let userInfo = notification.userInfo,
+                    let rawReason = (userInfo[AVAudioSessionRouteChangeReasonKey] as? NSNumber)?.uintValue,
+                    let reason = AVAudioSession.RouteChangeReason(rawValue: rawReason),
+                    reason == .oldDeviceUnavailable,
+                    self.currentEpisode != nil
+                else { return }
+                self.isPlaying = false
+                self.isBuffering = false
+                self.player?.pause()
+                self.updateNowPlaying()
+            }
+        }
+    }
+}
+
+extension AppSettings {
+    /// Point preference changes at playback and the system volume cap.
+    /// Called once at launch. The closures run only after a setting actually changes.
+    func connectPlaybackReactions() {
+        reactions.clampOutputVolume = { AudioPlayer.shared.clampOutputToMaxVolume() }
+        reactions.applyPlaybackRate = { AudioPlayer.shared.applyPlaybackRate() }
+        reactions.enforceSystemVolumeCap = { VolumeEnforcer.shared.enforceSystemVolumeCap() }
+        reactions.enforceSystemVolumeFloor = { VolumeEnforcer.shared.enforceSystemVolumeFloor() }
+        reactions.systemVolumeLockChanged = { AudioPlayer.shared.systemVolumeLockChanged() }
+        reactions.scheduleVolumeRangeReenable = { AudioPlayer.shared.scheduleVolumeRangeReenableIfNeeded() }
     }
 }
