@@ -62,16 +62,14 @@ struct QuietCastApp: App {
                     screen.brightness = dimmed
                 }
 
-                // Enforce system volume range on app open when the lock is on.
-                // VolumeEnforcer applies the nighttime / always-on check itself.
+                // On open and foreground, sample for 3 seconds and pull the system volume
+                // inside the cap and floor. The hidden slider may not be in a window on the
+                // first try, and outputVolume can stay stale until the audio session settles.
+                // VolumeEnforcer applies the nighttime / always-on check.
                 if AppSettings.systemVolumeCapEnabled {
                     let enforcer = VolumeEnforcer.shared
                     enforcer.installVolumeView()
-                    // Small delay to let the volume view attach
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
-                        enforcer.enforceSystemVolumeCap()
-                        enforcer.enforceSystemVolumeFloor()
-                    }
+                    enforcer.startVolumeEnforcement()
                 }
             case .inactive, .background:
                 // Flush any pending saves before the app is suspended

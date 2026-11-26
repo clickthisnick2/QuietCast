@@ -25,19 +25,31 @@ final class VolumeEnforcer {
     // MARK: - Setup
 
     /// Install a hidden MPVolumeView in the key window so its UISlider is accessible.
+    /// Reattaches when the view was created before a window existed, and looks up the
+    /// slider again when the first search missed it.
     func installVolumeView() {
-        guard volumeView == nil else { return }
-        let view = MPVolumeView(frame: CGRect(x: -1000, y: -1000, width: 1, height: 1))
-        view.alpha = 0.01
-        if let windowScene = UIApplication.shared.connectedScenes.first as? UIWindowScene,
+        let view: MPVolumeView
+        if let volumeView {
+            view = volumeView
+        } else {
+            let created = MPVolumeView(frame: CGRect(x: -1000, y: -1000, width: 1, height: 1))
+            created.alpha = 0.01
+            volumeView = created
+            view = created
+        }
+
+        if view.superview == nil || view.window == nil,
+           let windowScene = UIApplication.shared.connectedScenes.first as? UIWindowScene,
            let window = windowScene.windows.first {
             window.addSubview(view)
         }
-        volumeView = view
-        for subview in view.subviews {
-            if let slider = subview as? UISlider {
-                volumeSlider = slider
-                break
+
+        if volumeSlider == nil {
+            for subview in view.subviews {
+                if let slider = subview as? UISlider {
+                    volumeSlider = slider
+                    break
+                }
             }
         }
     }
@@ -52,14 +64,16 @@ final class VolumeEnforcer {
                 let capEnabled = AppSettings.systemVolumeCapEnabled
                 let cap = AppSettings.systemVolumeCap
                 let floor = AppSettings.systemVolumeFloor
-                if capEnabled && Self.shouldEnforce {
-                    if newVolume > cap {
-                        self?.volumeSlider?.value = cap
-                        self?.startVolumeEnforcement()
-                    } else if newVolume < floor {
-                        self?.volumeSlider?.value = floor
-                        self?.startVolumeEnforcement()
-                    }
+                if case .apply(let volume) = VolumePolicy.step(
+                    current: newVolume,
+                    cap: cap,
+                    floor: floor,
+                    shouldEnforce: Self.shouldEnforce,
+                    capEnabled: capEnabled,
+                    cancelled: false
+                ) {
+                    self?.setSystemVolume(volume)
+                    self?.startVolumeEnforcement()
                 }
                 self?.currentSystemVolume = newVolume
             }
@@ -87,26 +101,36 @@ final class VolumeEnforcer {
     }
 
     func setSystemVolume(_ volume: Float) {
-        if volumeSlider == nil { installVolumeView() }
+        installVolumeView()
         volumeSlider?.value = volume
     }
 
-    /// Rapidly enforce the cap for 3 seconds after a violation to catch repeated button presses.
-    private func startVolumeEnforcement() {
+    /// Sample the system volume for 3 seconds and pull it back inside the cap and floor.
+    /// Used after a volume-button violation, and on open or foreground: the first read can
+    /// be stale, and the hidden slider may not be in a window yet.
+    func startVolumeEnforcement() {
         volumeEnforcementTask?.cancel()
         volumeEnforcementTask = Task { @MainActor [weak self] in
             guard let self else { return }
             let cap = AppSettings.systemVolumeCap
             let floor = AppSettings.systemVolumeFloor
-            for _ in 0..<60 {
-                if Task.isCancelled || !Self.shouldEnforce { return }
-                let current = AVAudioSession.sharedInstance().outputVolume
-                if current > cap {
-                    self.volumeSlider?.value = cap
-                } else if current < floor {
-                    self.volumeSlider?.value = floor
+            for _ in 0..<VolumePolicy.retryCount {
+                switch VolumePolicy.step(
+                    current: AVAudioSession.sharedInstance().outputVolume,
+                    cap: cap,
+                    floor: floor,
+                    shouldEnforce: Self.shouldEnforce,
+                    capEnabled: AppSettings.systemVolumeCapEnabled,
+                    cancelled: Task.isCancelled
+                ) {
+                case .stop:
+                    return
+                case .unchanged:
+                    break
+                case .apply(let volume):
+                    self.setSystemVolume(volume)
                 }
-                try? await Task.sleep(nanoseconds: 50_000_000)
+                try? await Task.sleep(nanoseconds: VolumePolicy.retryIntervalNanoseconds)
             }
         }
     }

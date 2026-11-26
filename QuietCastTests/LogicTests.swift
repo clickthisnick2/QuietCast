@@ -74,6 +74,98 @@ final class TimeGateTests: XCTestCase {
     }
 }
 
+final class VolumePolicyTests: XCTestCase {
+    private let cap: Float = 0.14
+    private let floor: Float = 0.09
+
+    func testRetryWindowMatchesTheButtonPressLoop() {
+        XCTAssertEqual(VolumePolicy.retryCount, 60)
+        XCTAssertEqual(VolumePolicy.retryIntervalNanoseconds, 50_000_000)
+        let seconds = Double(VolumePolicy.retryCount) * Double(VolumePolicy.retryIntervalNanoseconds) / 1_000_000_000
+        XCTAssertEqual(seconds, 3, accuracy: 0.001)
+    }
+
+    func testMaxedVolumeOnOpenKeepsApplyingTheCapUntilTheReadingFalls() {
+        // A maxed system volume that only reports the real level after a stale sample.
+        let readings: [Float] = [1, 1, cap, cap]
+        var applied: [Float] = []
+        for reading in readings {
+            switch VolumePolicy.step(
+                current: reading,
+                cap: cap,
+                floor: floor,
+                shouldEnforce: true,
+                capEnabled: true,
+                cancelled: false
+            ) {
+            case .stop:
+                XCTFail("in-range or still-high readings should keep the retry loop running")
+                return
+            case .unchanged:
+                break
+            case .apply(let volume):
+                applied.append(volume)
+            }
+        }
+        XCTAssertEqual(applied, [cap, cap])
+    }
+
+    func testVolumeBelowTheFloorAppliesTheFloor() {
+        expect(.apply(floor), current: floor - 0.01)
+        expect(.unchanged, current: floor)
+        expect(.unchanged, current: cap)
+        expect(.apply(cap), current: cap + 0.01)
+    }
+
+    func testInRangeReadingDoesNotStopTheLoop() {
+        expect(.unchanged, current: (cap + floor) / 2)
+        expect(.unchanged, current: .nan)
+    }
+
+    func testEnforcementOffOrCancelledDoesNotWrite() {
+        expect(.stop, current: 1, shouldEnforce: false, capEnabled: true)
+        expect(.stop, current: 0, shouldEnforce: true, capEnabled: false)
+        expect(.stop, current: 1, shouldEnforce: false, capEnabled: false)
+        expect(.stop, current: 1, shouldEnforce: true, capEnabled: true, cancelled: true)
+    }
+
+    func testCapIsChosenBeforeTheFloor() {
+        // Same order as the previous loop: a reading above the cap is pulled to the cap
+        // even when the floor and cap have been set in the wrong order.
+        expect(.apply(0.10), current: 0.50, cap: 0.10, floor: 0.40)
+        expect(.apply(0.40), current: 0.05, cap: 0.10, floor: 0.40)
+    }
+
+    private func expect(
+        _ expected: VolumePolicy.Step,
+        current: Float,
+        cap: Float? = nil,
+        floor: Float? = nil,
+        shouldEnforce: Bool = true,
+        capEnabled: Bool = true,
+        cancelled: Bool = false,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        let step = VolumePolicy.step(
+            current: current,
+            cap: cap ?? self.cap,
+            floor: floor ?? self.floor,
+            shouldEnforce: shouldEnforce,
+            capEnabled: capEnabled,
+            cancelled: cancelled
+        )
+        switch (step, expected) {
+        case (.stop, .stop), (.unchanged, .unchanged):
+            break
+        case (.apply(let actual), .apply(let want)):
+            XCTAssertEqual(actual, want, file: file, line: line)
+        default:
+            XCTFail("expected \(String(describing: expected)), got \(String(describing: step))", file: file, line: line)
+        }
+    }
+}
+
 final class EpisodeAgeFilterTests: XCTestCase {
     func testOlderThanIncludesUndatedAndExcludesYoungEpisodes() {
         let now = Date(timeIntervalSince1970: 1_700_000_000)

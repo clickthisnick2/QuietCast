@@ -44,6 +44,7 @@ let package = Package(
                 "PersistenceManager.swift",
                 "RSSParser.swift",
                 "TimeGate.swift",
+                "VolumePolicy.swift",
             ],
             swiftSettings: [
                 .swiftLanguageMode(.v5),

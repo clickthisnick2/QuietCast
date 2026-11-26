@@ -114,6 +114,10 @@ final class AudioPlayer {
         VolumeEnforcer.shared.observeSystemVolume()
         claimNowPlayingSession()
         checkVolumeRangeReenableSchedule()
+        // outputVolume can still be stale right after the session activates.
+        if AppSettings.systemVolumeCapEnabled {
+            VolumeEnforcer.shared.startVolumeEnforcement()
+        }
     }
 
     /// Play a silent clip to claim the Now Playing session so headphone commands work immediately.
